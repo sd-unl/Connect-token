@@ -14,12 +14,18 @@ from google.auth.transport import requests as google_auth_requests
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
-# The secret link to your compiled .so files
-MEGA_LINK = "https://mega.nz/file/GIMg2I4Y#z2Zl0h5JFhnLQflQvOkz9gmthIqBpTvrCBJ2zYSOfRg"
+# Replace this with your actual Google Drive File ID
+GDRIVE_ID = "1A2B3C4D5E6F7G8H9I0J" 
 
-GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", None)
-SESSION_SECRET = os.environ.get("SESSION_SECRET", "change-this-to-a-random-string-in-production")
-DB_URL = os.environ.get("DATABASE_URL")
+# ... (Inside the /api/authorize route success response) ...
+# Change download_url to gdrive_id
+return jsonify({
+    "authorized": True,
+    "email": email,
+    "hours_remaining": round(remaining, 2),
+    "gdrive_id": GDRIVE_ID,  # <--- CHANGED THIS
+    "session_token": generate_session_token(email, remaining)
+})
 
 # --- DATABASE CONNECTION ---
 if DB_URL:
