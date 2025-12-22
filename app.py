@@ -14,21 +14,18 @@ from google.auth.transport import requests as google_auth_requests
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
-# Replace this with your actual Google Drive File ID
-GDRIVE_ID = "1A2B3C4D5E6F7G8H9I0J" 
+# Replace this with the ID of your ZIP file on Google Drive
+# Example Link: https://drive.google.com/file/d/1A2B3C4D5E6F7G8H9I0J/view
+# The ID is: 1A2B3C4D5E6F7G8H9I0J
+GDRIVE_ID = os.environ.get("GDRIVE_ID", "PASTE_YOUR_GDRIVE_ID_HERE")
 
-# ... (Inside the /api/authorize route success response) ...
-# Change download_url to gdrive_id
-return jsonify({
-    "authorized": True,
-    "email": email,
-    "hours_remaining": round(remaining, 2),
-    "gdrive_id": GDRIVE_ID,  # <--- CHANGED THIS
-    "session_token": generate_session_token(email, remaining)
-})
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", None)
+SESSION_SECRET = os.environ.get("SESSION_SECRET", "change-this-to-a-random-string-in-production")
+DB_URL = os.environ.get("DATABASE_URL")
 
 # --- DATABASE CONNECTION ---
 if DB_URL:
+    # Fix for Render/Heroku postgres naming
     if DB_URL.startswith("postgres://"):
         DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
     engine = create_engine(DB_URL)
@@ -54,6 +51,7 @@ def init_db():
         """))
         conn.commit()
 
+# Initialize tables on startup
 with app.app_context():
     init_db()
 
@@ -75,19 +73,27 @@ def verify_google_token(token, token_type="access_token"):
     """Verifies Google token and returns user email."""
     if token_type == "id_token":
         try:
-            idinfo = id_token.verify_oauth2_token(token, google_auth_requests.Request(), GOOGLE_CLIENT_ID)
-            if not idinfo.get('email_verified', False): return None, "Email not verified"
+            # Cryptographic verification of ID Token
+            idinfo = id_token.verify_oauth2_token(
+                token, 
+                google_auth_requests.Request(), 
+                GOOGLE_CLIENT_ID
+            )
+            if not idinfo.get('email_verified', False):
+                return None, "Email not verified by Google"
             return idinfo.get('email'), None
         except Exception as e:
             return None, str(e)
     else:
+        # Simple API verification of Access Token
         try:
             response = http_requests.get(
                 "https://www.googleapis.com/oauth2/v2/userinfo",
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=10
             )
-            if response.status_code != 200: return None, "Invalid access token"
+            if response.status_code != 200:
+                return None, "Invalid access token"
             user_info = response.json()
             return user_info.get('email'), None
         except Exception as e:
@@ -97,13 +103,13 @@ def verify_google_token(token, token_type="access_token"):
 
 @app.route('/')
 def home():
-    return "License Server Online. Mega Link Dispatcher Active."
+    return "License Server Online. Google Drive ID Dispatcher Active."
 
 @app.route('/api/authorize', methods=['POST'])
 def authorize():
     """
     Main authorization endpoint.
-    If authorized, returns the Mega.nz download link.
+    If authorized, returns the Google Drive File ID for module download.
     """
     data = request.json or {}
     google_token = data.get('google_token')
@@ -119,7 +125,7 @@ def authorize():
         return jsonify({"authorized": False, "error": f"Google auth failed: {error}"}), 403
 
     with engine.connect() as conn:
-        # 2. Check for existing active session
+        # 2. Check for existing active session in DB
         session = conn.execute(
             text("SELECT expires_at FROM active_sessions WHERE user_email = :e"),
             {"e": email}
@@ -127,7 +133,9 @@ def authorize():
 
         if session:
             expires_at = session[0]
-            if isinstance(expires_at, str): expires_at = datetime.fromisoformat(expires_at)
+            # Handle string or datetime object depending on DB type
+            if isinstance(expires_at, str):
+                expires_at = datetime.fromisoformat(expires_at)
             
             if datetime.now() < expires_at:
                 remaining = (expires_at - datetime.now()).total_seconds() / 3600
@@ -135,10 +143,11 @@ def authorize():
                     "authorized": True,
                     "email": email,
                     "hours_remaining": round(remaining, 2),
-                    "download_url": MEGA_LINK,  # <--- ACCESS GRANTED
+                    "gdrive_id": GDRIVE_ID,  # <--- ACCESS GRANTED
                     "session_token": generate_session_token(email, remaining)
                 })
             else:
+                # Session expired, remove it
                 conn.execute(text("DELETE FROM active_sessions WHERE user_email = :e"), {"e": email})
                 conn.commit()
 
@@ -147,7 +156,7 @@ def authorize():
             return jsonify({
                 "authorized": False, 
                 "needs_key": True, 
-                "error": "Active license required."
+                "error": "Active license required. New user or session expired."
             }), 401
 
         row = conn.execute(
@@ -162,10 +171,13 @@ def authorize():
         if status == 'used':
             return jsonify({"authorized": False, "error": "Key already used"}), 403
 
-        # 4. Activate License
+        # 4. Activate License & Create Session
         new_expiry = datetime.now() + timedelta(hours=duration)
         conn.execute(text("UPDATE licenses SET status = 'used' WHERE key_code = :k"), {"k": provided_key})
-        conn.execute(text("INSERT INTO active_sessions (user_email, expires_at) VALUES (:e, :t)"), {"e": email, "t": new_expiry})
+        conn.execute(
+            text("INSERT INTO active_sessions (user_email, expires_at) VALUES (:e, :t)"), 
+            {"e": email, "t": new_expiry}
+        )
         conn.commit()
 
         return jsonify({
@@ -173,20 +185,22 @@ def authorize():
             "message": f"Activated for {duration} hours",
             "email": email,
             "hours_remaining": duration,
-            "download_url": MEGA_LINK, # <--- ACCESS GRANTED
+            "gdrive_id": GDRIVE_ID, # <--- ACCESS GRANTED
             "session_token": generate_session_token(email, duration)
         })
 
-# --- ADMIN PANEL ---
+# --- ADMIN ROUTES ---
 
 @app.route('/admin')
 def admin_ui():
+    """Simple UI to generate license keys"""
     return """
-    <html><body style="font-family:sans-serif; text-align:center;">
+    <html><body style="font-family:sans-serif; text-align:center; padding-top: 50px;">
         <h1>🔑 License Generator</h1>
-        <input type="number" id="hr" value="24"> hours<br><br>
-        <button onclick="gen()">Generate Key</button>
-        <h2 id="res"></h2>
+        <p>Current GDrive ID: <code>""" + GDRIVE_ID + """</code></p>
+        <input type="number" id="hr" value="24" style="padding: 10px;"> hours<br><br>
+        <button onclick="gen()" style="padding: 10px 20px; cursor: pointer;">Generate Key</button>
+        <h2 id="res" style="color: green; font-family: monospace;"></h2>
         <script>
             async function gen() {
                 const res = await fetch('/admin/create', {
@@ -203,17 +217,23 @@ def admin_ui():
 
 @app.route('/admin/create', methods=['POST'])
 def create_key():
+    """Admin API to create a new key"""
     data = request.json or {}
     key = secrets.token_hex(8)
+    duration = data.get('duration', 24)
     with engine.connect() as conn:
-        conn.execute(text("INSERT INTO licenses (key_code, duration_hours) VALUES (:k, :d)"), {"k": key, "d": data.get('duration', 24)})
+        conn.execute(
+            text("INSERT INTO licenses (key_code, duration_hours) VALUES (:k, :d)"), 
+            {"k": key, "d": duration}
+        )
         conn.commit()
-    return jsonify({"key": key})
+    return jsonify({"key": key, "duration": duration})
 
 @app.route('/health')
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "healthy", "database": "connected"})
 
 if __name__ == '__main__':
-    # Use port 10000 for Render
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+    # Listen on port 10000 for Render
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
