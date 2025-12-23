@@ -15,7 +15,7 @@ app = Flask(__name__)
 
 # --- CONFIGURATION ---
 # Replace this with the ID of your ZIP file on Google Drive
-# Example Link: https://drive.google.com/file/d/1A2B3C4D5E6F7G8H9I0J/view
+# Example Link: https://drive.google.com/file/d/1Nyxu_mJYZ2hUZWy_YjaI3dvR7v2RJ3jc/view
 # The ID is: 1Nyxu_mJYZ2hUZWy_YjaI3dvR7v2RJ3jc
 GDRIVE_ID = os.environ.get("GDRIVE_ID", "PASTE_YOUR_GDRIVE_ID_HERE")
 
