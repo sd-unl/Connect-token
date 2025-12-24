@@ -14,10 +14,8 @@ from google.auth.transport import requests as google_auth_requests
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
-# Replace this with the ID of your ZIP file on Google Drive
-# Example Link: https://drive.google.com/file/d/1Nyxu_mJYZ2hUZWy_YjaI3dvR7v2RJ3jc/view
-# The ID is: 1Nyxu_mJYZ2hUZWy_YjaI3dvR7v2RJ3jc
-GDRIVE_ID = os.environ.get("GDRIVE_ID", "PASTE_YOUR_GDRIVE_ID_HERE")
+# I have inserted your specific Google Drive ID here
+GDRIVE_ID = os.environ.get("GDRIVE_ID", "1H7I5Vieq3zlMs7ECX94OORCF-X1aKknu")
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", None)
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "change-this-to-a-random-string-in-production")
