@@ -6,16 +6,17 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from sqlalchemy import create_engine, text
 
-# Google Auth imports
+# --- FIXED IMPORTS ---
+# 1. Standard requests library for HTTP calls (like getting userinfo)
+import requests as http_requests
+# 2. Google Auth specific requests for the Request class (for ID tokens)
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_auth_requests
 
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
-# We still use this as a fallback or initial setup, but we primarily use the DB now
 DEFAULT_GDRIVE_ID = os.environ.get("GDRIVE_ID", "PASTE_YOUR_GDRIVE_ID_HERE")
-
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", None)
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "change-this-secret-now")
 DB_URL = os.environ.get("DATABASE_URL")
@@ -32,7 +33,6 @@ else:
 # --- DATABASE INITIALIZATION ---
 def init_db():
     with engine.connect() as conn:
-        # 1. Existing License Table
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS licenses (
                 key_code TEXT PRIMARY KEY,
@@ -41,17 +41,15 @@ def init_db():
             );
         """))
         
-        # 2. NEW: File Registry Table (Stores multiple GDrive IDs)
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS file_registry (
                 id SERIAL PRIMARY KEY,
-                name TEXT UNIQUE NOT NULL,      -- e.g., "app_v1", "plugin_extra"
+                name TEXT UNIQUE NOT NULL,
                 gdrive_id TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """))
         
-        # 3. Existing Sessions Table
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS active_sessions (
                 user_email TEXT PRIMARY KEY,
@@ -75,6 +73,7 @@ def generate_session_token(email, hours):
     return f"{email}:{expiry_str}:{signature}"
 
 def verify_google_token(token, token_type="access_token"):
+    """Verifies Google token and returns user email."""
     if token_type == "id_token":
         try:
             idinfo = id_token.verify_oauth2_token(
@@ -84,8 +83,9 @@ def verify_google_token(token, token_type="access_token"):
             return idinfo.get('email'), None
         except Exception as e: return None, str(e)
     else:
+        # FIX: Use the standard 'http_requests' library, not google_auth_requests
         try:
-            response = google_auth_requests.get(
+            response = http_requests.get(
                 "https://www.googleapis.com/oauth2/v2/userinfo",
                 headers={"Authorization": f"Bearer {token}"}, timeout=10
             )
@@ -97,7 +97,7 @@ def verify_google_token(token, token_type="access_token"):
 
 @app.route('/')
 def home():
-    return "License Server v2. Multi-File Support Active."
+    return "License Server v2 (Fixed). Multi-File Support Active."
 
 @app.route('/api/authorize', methods=['POST'])
 def authorize():
@@ -105,7 +105,7 @@ def authorize():
     google_token = data.get('google_token')
     token_type = data.get('token_type', 'access_token')
     provided_key = data.get('key')
-    requested_file = data.get('requested_file') # The specific file name requested by Colab
+    requested_file = data.get('requested_file')
 
     if not google_token:
         return jsonify({"authorized": False, "error": "Google token required"}), 400
@@ -141,7 +141,6 @@ def authorize():
                     else:
                         return jsonify({"authorized": False, "error": f"File '{requested_file}' not found on server."}), 404
                 else:
-                    # If no specific file requested, get the first one in DB or default
                     row = conn.execute(text("SELECT gdrive_id FROM file_registry LIMIT 1")).fetchone()
                     gdrive_id_to_return = row[0] if row else DEFAULT_GDRIVE_ID
 
@@ -171,7 +170,6 @@ def authorize():
         conn.execute(text("INSERT INTO active_sessions (user_email, expires_at) VALUES (:e, :t)"), {"e": email, "t": new_expiry})
         conn.commit()
 
-        # Logic for selecting file on first activation
         if requested_file:
             file_row = conn.execute(text("SELECT gdrive_id FROM file_registry WHERE name = :n"), {"n": requested_file}).fetchone()
             gdrive_id_to_return = file_row[0] if file_row else DEFAULT_GDRIVE_ID
@@ -194,17 +192,14 @@ def admin_ui():
     <html><body style="font-family:sans-serif; padding: 20px; max-width: 800px; margin: auto;">
         <h1>🛠️ Admin Dashboard</h1>
         
-        <!-- SECTION 1: FILES -->
         <div style="background:#f4f4f4; padding:15px; border-radius:8px; margin-bottom:20px;">
             <h2>📂 Manage Files</h2>
-            <p>Add Google Drive files here. You can name them (e.g., "app_v1", "plugin_bonus").</p>
             <input type="text" id="fname" placeholder="File Name (e.g., app_v1)" style="width: 200px; padding: 5px;">
             <input type="text" id="fid" placeholder="GDrive ID (e.g., 1H7I5...)" style="width: 300px; padding: 5px;">
             <button onclick="addFile()" style="padding: 5px 15px;">Add File</button>
             <div id="fileList" style="margin-top:10px; font-family:monospace; font-size:12px;"></div>
         </div>
 
-        <!-- SECTION 2: KEYS -->
         <div style="background:#eef; padding:15px; border-radius:8px;">
             <h2>🔑 License Generator</h2>
             <input type="number" id="hr" value="24" style="padding: 10px;"> hours<br><br>
@@ -213,42 +208,26 @@ def admin_ui():
         </div>
 
         <script>
-            // Load files on start
             loadFiles();
-
             async function loadFiles() {
                 const res = await fetch('/admin/get_files');
                 const data = await res.json();
                 const list = data.files;
                 let html = '<strong>Registered Files:</strong><ul>';
-                list.forEach(f => {
-                    html += `<li><b>${f.name}</b>: ${f.gdrive_id}</li>`;
-                });
+                list.forEach(f => { html += `<li><b>${f.name}</b>: ${f.gdrive_id}</li>`; });
                 html += '</ul>';
                 document.getElementById('fileList').innerHTML = html;
             }
-
             async function addFile() {
                 const name = document.getElementById('fname').value;
                 const id = document.getElementById('fid').value;
                 if(!name || !id) return alert("Fill both fields");
-                
-                await fetch('/admin/add_file', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({name: name, gdrive_id: id})
-                });
-                document.getElementById('fname').value = '';
-                document.getElementById('fid').value = '';
+                await fetch('/admin/add_file', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name: name, gdrive_id: id}) });
+                document.getElementById('fname').value = ''; document.getElementById('fid').value = '';
                 loadFiles();
             }
-
             async function genKey() {
-                const res = await fetch('/admin/create', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({duration: parseInt(document.getElementById('hr').value)})
-                });
+                const res = await fetch('/admin/create', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({duration: parseInt(document.getElementById('hr').value)}) });
                 const d = await res.json();
                 document.getElementById('res').innerText = d.key;
             }
@@ -266,14 +245,9 @@ def get_files():
 @app.route('/admin/add_file', methods=['POST'])
 def add_file():
     data = request.json
-    name = data.get('name')
-    gid = data.get('gdrive_id')
     try:
         with engine.connect() as conn:
-            conn.execute(
-                text("INSERT INTO file_registry (name, gdrive_id) VALUES (:n, :g)"),
-                {"n": name, "g": gid}
-            )
+            conn.execute(text("INSERT INTO file_registry (name, gdrive_id) VALUES (:n, :g)"), {"n": data.get('name'), "g": data.get('gdrive_id')})
             conn.commit()
         return jsonify({"status": "success"})
     except Exception as e:
