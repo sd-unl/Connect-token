@@ -5,39 +5,34 @@ import hashlib
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from sqlalchemy import create_engine, text
-import requests as http_requests
 
-# Google Auth imports for ID Token verification
+# Google Auth imports
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_auth_requests
 
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
-# Read the GDRIVE_ID from the Environment Variable
-GDRIVE_ID = os.environ.get("GDRIVE_ID")
-
-# Safety Check: Stop the server if the variable is missing
-if not GDRIVE_ID:
-    raise ValueError("⚠️ FATAL: 'GDRIVE_ID' environment variable is not set in Render Dashboard.")
+# We still use this as a fallback or initial setup, but we primarily use the DB now
+DEFAULT_GDRIVE_ID = os.environ.get("GDRIVE_ID", "PASTE_YOUR_GDRIVE_ID_HERE")
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", None)
-SESSION_SECRET = os.environ.get("SESSION_SECRET", "change-this-to-a-random-string-in-production")
+SESSION_SECRET = os.environ.get("SESSION_SECRET", "change-this-secret-now")
 DB_URL = os.environ.get("DATABASE_URL")
 
 # --- DATABASE CONNECTION ---
 if DB_URL:
-    # Fix for Render/Heroku postgres naming
     if DB_URL.startswith("postgres://"):
         DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
     engine = create_engine(DB_URL)
 else:
-    print("⚠️ WARNING: DATABASE_URL not set. Using temporary local SQLite.")
+    print("⚠️ WARNING: DATABASE_URL not set. Using local SQLite.")
     engine = create_engine("sqlite:///temp.db")
 
 # --- DATABASE INITIALIZATION ---
 def init_db():
     with engine.connect() as conn:
+        # 1. Existing License Table
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS licenses (
                 key_code TEXT PRIMARY KEY,
@@ -45,6 +40,18 @@ def init_db():
                 duration_hours INT DEFAULT 24
             );
         """))
+        
+        # 2. NEW: File Registry Table (Stores multiple GDrive IDs)
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS file_registry (
+                id SERIAL PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL,      -- e.g., "app_v1", "plugin_extra"
+                gdrive_id TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """))
+        
+        # 3. Existing Sessions Table
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS active_sessions (
                 user_email TEXT PRIMARY KEY,
@@ -53,158 +60,190 @@ def init_db():
         """))
         conn.commit()
 
-# Initialize tables on startup
 with app.app_context():
     init_db()
 
 # --- HELPER FUNCTIONS ---
 
 def generate_session_token(email, hours):
-    """Generate a signed session token for .so module verification."""
     expiry = datetime.now() + timedelta(hours=hours)
     expiry_str = expiry.isoformat()
     message = f"{email}:{expiry_str}"
     signature = hmac.new(
-        SESSION_SECRET.encode(),
-        message.encode(),
-        hashlib.sha256
+        SESSION_SECRET.encode(), message.encode(), hashlib.sha256
     ).hexdigest()[:16]
     return f"{email}:{expiry_str}:{signature}"
 
 def verify_google_token(token, token_type="access_token"):
-    """Verifies Google token and returns user email."""
     if token_type == "id_token":
         try:
-            # Cryptographic verification of ID Token
             idinfo = id_token.verify_oauth2_token(
-                token, 
-                google_auth_requests.Request(), 
-                GOOGLE_CLIENT_ID
+                token, google_auth_requests.Request(), GOOGLE_CLIENT_ID
             )
-            if not idinfo.get('email_verified', False):
-                return None, "Email not verified by Google"
+            if not idinfo.get('email_verified', False): return None, "Email not verified"
             return idinfo.get('email'), None
-        except Exception as e:
-            return None, str(e)
+        except Exception as e: return None, str(e)
     else:
-        # Simple API verification of Access Token
         try:
-            response = http_requests.get(
+            response = google_auth_requests.get(
                 "https://www.googleapis.com/oauth2/v2/userinfo",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=10
+                headers={"Authorization": f"Bearer {token}"}, timeout=10
             )
-            if response.status_code != 200:
-                return None, "Invalid access token"
-            user_info = response.json()
-            return user_info.get('email'), None
-        except Exception as e:
-            return None, str(e)
+            if response.status_code != 200: return None, "Invalid token"
+            return response.json().get('email'), None
+        except Exception as e: return None, str(e)
 
 # --- ROUTES ---
 
 @app.route('/')
 def home():
-    return "License Server Online. Google Drive ID Dispatcher Active."
+    return "License Server v2. Multi-File Support Active."
 
 @app.route('/api/authorize', methods=['POST'])
 def authorize():
-    """
-    Main authorization endpoint.
-    If authorized, returns the Google Drive File ID for module download.
-    """
     data = request.json or {}
     google_token = data.get('google_token')
     token_type = data.get('token_type', 'access_token')
     provided_key = data.get('key')
+    requested_file = data.get('requested_file') # The specific file name requested by Colab
 
     if not google_token:
         return jsonify({"authorized": False, "error": "Google token required"}), 400
 
-    # 1. Verify Google Identity
+    # 1. Verify Identity
     email, error = verify_google_token(google_token, token_type)
     if error:
         return jsonify({"authorized": False, "error": f"Google auth failed: {error}"}), 403
 
+    gdrive_id_to_return = None
+
     with engine.connect() as conn:
-        # 2. Check for existing active session in DB
+        # 2. Check Session
         session = conn.execute(
-            text("SELECT expires_at FROM active_sessions WHERE user_email = :e"),
-            {"e": email}
+            text("SELECT expires_at FROM active_sessions WHERE user_email = :e"), {"e": email}
         ).fetchone()
 
         if session:
             expires_at = session[0]
-            # Handle string or datetime object depending on DB type
-            if isinstance(expires_at, str):
-                expires_at = datetime.fromisoformat(expires_at)
+            if isinstance(expires_at, str): expires_at = datetime.fromisoformat(expires_at)
             
             if datetime.now() < expires_at:
                 remaining = (expires_at - datetime.now()).total_seconds() / 3600
+                
+                # 3. GET THE REQUESTED FILE ID
+                if requested_file:
+                    file_row = conn.execute(
+                        text("SELECT gdrive_id FROM file_registry WHERE name = :n"), 
+                        {"n": requested_file}
+                    ).fetchone()
+                    if file_row:
+                        gdrive_id_to_return = file_row[0]
+                    else:
+                        return jsonify({"authorized": False, "error": f"File '{requested_file}' not found on server."}), 404
+                else:
+                    # If no specific file requested, get the first one in DB or default
+                    row = conn.execute(text("SELECT gdrive_id FROM file_registry LIMIT 1")).fetchone()
+                    gdrive_id_to_return = row[0] if row else DEFAULT_GDRIVE_ID
+
                 return jsonify({
-                    "authorized": True,
-                    "email": email,
-                    "hours_remaining": round(remaining, 2),
-                    "gdrive_id": GDRIVE_ID,  # <--- ACCESS GRANTED
+                    "authorized": True, "email": email, "hours_remaining": round(remaining, 2),
+                    "gdrive_id": gdrive_id_to_return,
                     "session_token": generate_session_token(email, remaining)
                 })
             else:
-                # Session expired, remove it
                 conn.execute(text("DELETE FROM active_sessions WHERE user_email = :e"), {"e": email})
                 conn.commit()
 
-        # 3. If no session, check for License Key
+        # 4. Check License Key
         if not provided_key:
-            return jsonify({
-                "authorized": False, 
-                "needs_key": True, 
-                "error": "Active license required. New user or session expired."
-            }), 401
+            return jsonify({"authorized": False, "needs_key": True, "error": "Active license required."}), 401
 
         row = conn.execute(
-            text("SELECT status, duration_hours FROM licenses WHERE key_code = :k"),
-            {"k": provided_key}
+            text("SELECT status, duration_hours FROM licenses WHERE key_code = :k"), {"k": provided_key}
         ).fetchone()
 
-        if not row:
-            return jsonify({"authorized": False, "error": "Invalid license key"}), 403
-        
-        status, duration = row
-        if status == 'used':
-            return jsonify({"authorized": False, "error": "Key already used"}), 403
+        if not row: return jsonify({"authorized": False, "error": "Invalid license key"}), 403
+        if row[0] == 'used': return jsonify({"authorized": False, "error": "Key already used"}), 403
 
-        # 4. Activate License & Create Session
-        new_expiry = datetime.now() + timedelta(hours=duration)
+        # 5. Activate & Determine File
+        new_expiry = datetime.now() + timedelta(hours=row[1])
         conn.execute(text("UPDATE licenses SET status = 'used' WHERE key_code = :k"), {"k": provided_key})
-        conn.execute(
-            text("INSERT INTO active_sessions (user_email, expires_at) VALUES (:e, :t)"), 
-            {"e": email, "t": new_expiry}
-        )
+        conn.execute(text("INSERT INTO active_sessions (user_email, expires_at) VALUES (:e, :t)"), {"e": email, "t": new_expiry})
         conn.commit()
 
+        # Logic for selecting file on first activation
+        if requested_file:
+            file_row = conn.execute(text("SELECT gdrive_id FROM file_registry WHERE name = :n"), {"n": requested_file}).fetchone()
+            gdrive_id_to_return = file_row[0] if file_row else DEFAULT_GDRIVE_ID
+        else:
+            row = conn.execute(text("SELECT gdrive_id FROM file_registry LIMIT 1")).fetchone()
+            gdrive_id_to_return = row[0] if row else DEFAULT_GDRIVE_ID
+
         return jsonify({
-            "authorized": True,
-            "message": f"Activated for {duration} hours",
-            "email": email,
-            "hours_remaining": duration,
-            "gdrive_id": GDRIVE_ID, # <--- ACCESS GRANTED
-            "session_token": generate_session_token(email, duration)
+            "authorized": True, "message": f"Activated for {row[1]} hours",
+            "email": email, "hours_remaining": row[1],
+            "gdrive_id": gdrive_id_to_return,
+            "session_token": generate_session_token(email, row[1])
         })
 
 # --- ADMIN ROUTES ---
 
 @app.route('/admin')
 def admin_ui():
-    """Simple UI to generate license keys"""
     return """
-    <html><body style="font-family:sans-serif; text-align:center; padding-top: 50px;">
-        <h1>🔑 License Generator</h1>
-        <p>Current GDrive ID: <code>""" + GDRIVE_ID + """</code></p>
-        <input type="number" id="hr" value="24" style="padding: 10px;"> hours<br><br>
-        <button onclick="gen()" style="padding: 10px 20px; cursor: pointer;">Generate Key</button>
-        <h2 id="res" style="color: green; font-family: monospace;"></h2>
+    <html><body style="font-family:sans-serif; padding: 20px; max-width: 800px; margin: auto;">
+        <h1>🛠️ Admin Dashboard</h1>
+        
+        <!-- SECTION 1: FILES -->
+        <div style="background:#f4f4f4; padding:15px; border-radius:8px; margin-bottom:20px;">
+            <h2>📂 Manage Files</h2>
+            <p>Add Google Drive files here. You can name them (e.g., "app_v1", "plugin_bonus").</p>
+            <input type="text" id="fname" placeholder="File Name (e.g., app_v1)" style="width: 200px; padding: 5px;">
+            <input type="text" id="fid" placeholder="GDrive ID (e.g., 1H7I5...)" style="width: 300px; padding: 5px;">
+            <button onclick="addFile()" style="padding: 5px 15px;">Add File</button>
+            <div id="fileList" style="margin-top:10px; font-family:monospace; font-size:12px;"></div>
+        </div>
+
+        <!-- SECTION 2: KEYS -->
+        <div style="background:#eef; padding:15px; border-radius:8px;">
+            <h2>🔑 License Generator</h2>
+            <input type="number" id="hr" value="24" style="padding: 10px;"> hours<br><br>
+            <button onclick="genKey()" style="padding: 10px 20px;">Generate Key</button>
+            <h2 id="res" style="color: green; font-family: monospace;"></h2>
+        </div>
+
         <script>
-            async function gen() {
+            // Load files on start
+            loadFiles();
+
+            async function loadFiles() {
+                const res = await fetch('/admin/get_files');
+                const data = await res.json();
+                const list = data.files;
+                let html = '<strong>Registered Files:</strong><ul>';
+                list.forEach(f => {
+                    html += `<li><b>${f.name}</b>: ${f.gdrive_id}</li>`;
+                });
+                html += '</ul>';
+                document.getElementById('fileList').innerHTML = html;
+            }
+
+            async function addFile() {
+                const name = document.getElementById('fname').value;
+                const id = document.getElementById('fid').value;
+                if(!name || !id) return alert("Fill both fields");
+                
+                await fetch('/admin/add_file', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({name: name, gdrive_id: id})
+                });
+                document.getElementById('fname').value = '';
+                document.getElementById('fid').value = '';
+                loadFiles();
+            }
+
+            async function genKey() {
                 const res = await fetch('/admin/create', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
@@ -217,25 +256,39 @@ def admin_ui():
     </body></html>
     """
 
+@app.route('/admin/get_files', methods=['GET'])
+def get_files():
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT name, gdrive_id FROM file_registry ORDER BY id DESC")).fetchall()
+        files = [{"name": r[0], "gdrive_id": r[1]} for r in rows]
+        return jsonify({"files": files})
+
+@app.route('/admin/add_file', methods=['POST'])
+def add_file():
+    data = request.json
+    name = data.get('name')
+    gid = data.get('gdrive_id')
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text("INSERT INTO file_registry (name, gdrive_id) VALUES (:n, :g)"),
+                {"n": name, "g": gid}
+            )
+            conn.commit()
+        return jsonify({"status": "success"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
 @app.route('/admin/create', methods=['POST'])
 def create_key():
-    """Admin API to create a new key"""
     data = request.json or {}
     key = secrets.token_hex(8)
     duration = data.get('duration', 24)
     with engine.connect() as conn:
-        conn.execute(
-            text("INSERT INTO licenses (key_code, duration_hours) VALUES (:k, :d)"), 
-            {"k": key, "d": duration}
-        )
+        conn.execute(text("INSERT INTO licenses (key_code, duration_hours) VALUES (:k, :d)"), {"k": key, "d": duration})
         conn.commit()
     return jsonify({"key": key, "duration": duration})
 
-@app.route('/health')
-def health():
-    return jsonify({"status": "healthy", "database": "connected"})
-
 if __name__ == '__main__':
-    # Listen on port 10000 for Render
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
